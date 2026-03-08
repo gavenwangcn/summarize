@@ -2,6 +2,7 @@ import { buildUserScriptsGuidance, getUserScriptsStatus } from "../../automation
 import { readPresetOrCustomValue, resolvePresetOrCustom } from "../../lib/combo";
 import { defaultSettings, loadSettings, saveSettings } from "../../lib/settings";
 import { applyTheme, type ColorMode, type ColorScheme } from "../../lib/theme";
+import { bindOptionsInputs } from "./bindings";
 import { createDaemonStatusChecker } from "./daemon-status";
 import { getOptionsElements } from "./elements";
 import { createLogsViewer } from "./logs-viewer";
@@ -543,18 +544,6 @@ async function load() {
   isInitializing = false;
 }
 
-let refreshTimer = 0;
-tokenEl.addEventListener("input", () => {
-  window.clearTimeout(refreshTimer);
-  refreshTimer = window.setTimeout(() => {
-    void modelPresets.refreshPresets(tokenEl.value);
-    void checkDaemonStatus(tokenEl.value);
-    logsViewer.handleTokenChanged();
-    processesViewer.handleTokenChanged();
-  }, 350);
-  scheduleAutoSave(600);
-});
-
 const copyToken = async () => {
   const token = tokenEl.value.trim();
   if (!token) {
@@ -575,138 +564,50 @@ const copyToken = async () => {
   flashStatus(ok ? "Token copied" : "Copy failed");
 };
 
-tokenCopyBtn.addEventListener("click", () => {
-  void copyToken();
-});
-
 const refreshModelsIfStale = () => {
   modelPresets.refreshIfStale(tokenEl.value);
 };
 
-modelPresetEl.addEventListener("focus", refreshModelsIfStale);
-modelPresetEl.addEventListener("pointerdown", refreshModelsIfStale);
-modelCustomEl.addEventListener("focus", refreshModelsIfStale);
-modelCustomEl.addEventListener("pointerdown", refreshModelsIfStale);
-
-languagePresetEl.addEventListener("change", () => {
-  languageCustomEl.hidden = languagePresetEl.value !== "custom";
-  if (!languageCustomEl.hidden) languageCustomEl.focus();
-  scheduleAutoSave(200);
-});
-
-hoverPromptResetBtn.addEventListener("click", () => {
-  hoverPromptEl.value = defaultSettings.hoverPrompt;
-  scheduleAutoSave(200);
-});
-
-modelPresetEl.addEventListener("change", () => {
-  modelCustomEl.hidden = modelPresetEl.value !== "custom";
-  if (!modelCustomEl.hidden) modelCustomEl.focus();
-  scheduleAutoSave(200);
-});
-
-modelCustomEl.addEventListener("input", () => {
-  scheduleAutoSave(600);
-});
-
-languageCustomEl.addEventListener("input", () => {
-  scheduleAutoSave(600);
-});
-
-promptOverrideEl.addEventListener("input", () => {
-  scheduleAutoSave(600);
-});
-
-hoverPromptEl.addEventListener("input", () => {
-  scheduleAutoSave(600);
-});
-
-maxCharsEl.addEventListener("input", () => {
-  scheduleAutoSave(400);
-});
-
-requestModeEl.addEventListener("change", () => {
-  scheduleAutoSave(200);
-});
-
-firecrawlModeEl.addEventListener("change", () => {
-  scheduleAutoSave(200);
-});
-
-markdownModeEl.addEventListener("change", () => {
-  scheduleAutoSave(200);
-});
-
-preprocessModeEl.addEventListener("change", () => {
-  scheduleAutoSave(200);
-});
-
-youtubeModeEl.addEventListener("change", () => {
-  scheduleAutoSave(200);
-});
-
-transcriberEl.addEventListener("change", () => {
-  scheduleAutoSave(200);
-});
-
-timeoutEl.addEventListener("input", () => {
-  scheduleAutoSave(400);
-});
-
-retriesEl.addEventListener("input", () => {
-  scheduleAutoSave(300);
-});
-
-maxOutputTokensEl.addEventListener("input", () => {
-  scheduleAutoSave(300);
-});
-
-autoCliOrderEl.addEventListener("input", () => {
-  scheduleAutoSave(300);
-});
-
-fontFamilyEl.addEventListener("input", () => {
-  scheduleAutoSave(600);
-});
-
-fontSizeEl.addEventListener("input", () => {
-  scheduleAutoSave(300);
-});
-
-logsSourceEl.addEventListener("change", () => {
-  void logsViewer.refresh();
-});
-
-logsTailEl.addEventListener("change", () => {
-  void logsViewer.refresh();
-});
-
-logsParsedEl.addEventListener("change", () => {
-  logsViewer.render();
-});
-
-for (const input of logsLevelInputs) {
-  input.addEventListener("change", () => {
-    logsViewer.render();
-  });
-}
-
-logsAutoEl.addEventListener("change", () => {
-  if (logsAutoEl.checked) {
-    logsViewer.startAuto();
-    void logsViewer.refresh();
-  } else {
-    logsViewer.stopAuto();
-  }
-});
-
-window.addEventListener("beforeunload", () => {
-  logsViewer.stopAuto();
-});
-
-formEl.addEventListener("submit", (e) => {
-  e.preventDefault();
-  void saveNow();
+bindOptionsInputs({
+  elements: {
+    formEl,
+    tokenEl,
+    tokenCopyBtn,
+    modelPresetEl,
+    modelCustomEl,
+    languagePresetEl,
+    languageCustomEl,
+    promptOverrideEl,
+    hoverPromptEl,
+    hoverPromptResetBtn,
+    maxCharsEl,
+    requestModeEl,
+    firecrawlModeEl,
+    markdownModeEl,
+    preprocessModeEl,
+    youtubeModeEl,
+    transcriberEl,
+    timeoutEl,
+    retriesEl,
+    maxOutputTokensEl,
+    autoCliOrderEl,
+    fontFamilyEl,
+    fontSizeEl,
+    logsSourceEl,
+    logsTailEl,
+    logsParsedEl,
+    logsAutoEl,
+    logsLevelInputs,
+  },
+  scheduleAutoSave,
+  saveNow,
+  checkDaemonStatus,
+  modelPresets,
+  logsViewer,
+  processesViewer,
+  copyToken,
+  refreshModelsIfStale,
+  defaultHoverPrompt: defaultSettings.hoverPrompt,
 });
 
 setBuildInfo();
