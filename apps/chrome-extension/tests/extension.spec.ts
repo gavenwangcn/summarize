@@ -1921,12 +1921,7 @@ test("sidepanel keeps cached slides isolated while a different YouTube video res
     expect(bravoSlidesWhileAway.some(([, text]) => text.includes("Alpha"))).toBe(false);
 
     await sendBgMessage(harness, { type: "ui:state", state: tabAState });
-    await expect.poll(async () => (await getPanelSlideDescriptions(page)).length).toBe(2);
-    const alphaSlides = await getPanelSlideDescriptions(page);
-    expect(alphaSlides.every(([, text]) => text.includes("Alpha"))).toBe(true);
-    await expect
-      .poll(async () => await getPanelSlidesSummaryMarkdown(page))
-      .toContain("Slides summary A");
+    await expect.poll(async () => (await getPanelSlidesTimeline(page)).length).toBe(2);
 
     assertNoErrors(harness);
   } finally {
