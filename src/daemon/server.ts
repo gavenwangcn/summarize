@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { createReadStream, promises as fs } from "node:fs";
+import { promises as fs } from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import { Writable } from "node:stream";
@@ -11,9 +11,8 @@ import { refreshFree } from "../refresh-free.js";
 import { createCacheStateFromConfig, refreshCacheStoreIfMissing } from "../run/cache-state.js";
 import { resolveExecutableInPath } from "../run/env.js";
 import { createMediaCacheFromConfig } from "../run/media-cache-state.js";
-import { encodeSseEvent, type SseEvent } from "../shared/sse-events.js";
-import type { SlideExtractionResult, SlideSettings } from "../slides/index.js";
-import { resolveSlideImagePath } from "../slides/index.js";
+import { type SseEvent } from "../shared/sse-events.js";
+import type { SlideSettings } from "../slides/index.js";
 import { resolvePackageVersion } from "../version.js";
 import { type DaemonRequestedMode } from "./auto-mode.js";
 import { daemonConfigTokens, type DaemonConfig } from "./config.js";
@@ -30,6 +29,7 @@ import {
   readCorsHeaders,
   text,
 } from "./server-http.js";
+import { handleSessionRoutes } from "./server-session-routes.js";
 import {
   createSession,
   emitMeta,
@@ -43,14 +43,12 @@ import {
   type Session,
   type SessionEvent,
 } from "./server-session.js";
-import { attachBufferedSseSession } from "./server-sse.js";
 import {
-  buildSlidesPayload,
   executeSummarizeSession,
   handleExtractOnlySummarizeRequest,
   toExtractOnlySlidesPayload,
 } from "./server-summarize-execution.js";
-import { parseSummarizeRequest, resolveHomeDir } from "./server-summarize-request.js";
+import { parseSummarizeRequest } from "./server-summarize-request.js";
 
 export { corsHeaders, isTrustedOrigin } from "./server-http.js";
 
@@ -363,223 +361,18 @@ export async function runDaemonServer({
         return;
       }
 
-      const slidesMatch = pathname.match(/^\/v1\/summarize\/([^/]+)\/slides$/);
-      if (req.method === "GET" && slidesMatch) {
-        const id = slidesMatch[1];
-        const session = id ? sessions.get(id) : null;
-        if (!session || !session.slides) {
-          json(res, 200, { ok: false, error: "not found" }, cors);
-          return;
-        }
-        json(
+      if (
+        await handleSessionRoutes({
+          req,
           res,
-          200,
-          { ok: true, slides: buildSlidesPayload({ slides: session.slides, port }) },
+          pathname,
           cors,
-        );
-        return;
-      }
-
-      const slideImageMatch = pathname.match(/^\/v1\/summarize\/([^/]+)\/slides\/(\d+)$/);
-      if (req.method === "GET" && slideImageMatch) {
-        const id = slideImageMatch[1];
-        const index = Number(slideImageMatch[2]);
-        const session = id ? sessions.get(id) : null;
-        if (!session || !session.slides || !Number.isFinite(index)) {
-          json(res, 404, { ok: false, error: "not found" }, cors);
-          return;
-        }
-        const slide = session.slides.slides.find((item) => item.index === index);
-        if (!slide) {
-          json(res, 404, { ok: false, error: "not found" }, cors);
-          return;
-        }
-        try {
-          const stat = await fs.stat(slide.imagePath);
-          res.writeHead(200, {
-            "content-type": "image/png",
-            "content-length": stat.size.toString(),
-            "cache-control": "no-cache",
-            ...cors,
-          });
-          const stream = createReadStream(slide.imagePath);
-          stream.pipe(res);
-          stream.on("error", () => res.end());
-        } catch {
-          json(res, 404, { ok: false, error: "not found" }, cors);
-        }
-        return;
-      }
-
-      const stableSlideImageMatch = pathname.match(/^\/v1\/slides\/([^/]+)\/(\d+)$/);
-      if (req.method === "GET" && stableSlideImageMatch) {
-        const sourceId = stableSlideImageMatch[1];
-        const index = Number(stableSlideImageMatch[2]);
-        if (!sourceId || !Number.isFinite(index) || index <= 0) {
-          json(res, 404, { ok: false, error: "not found" }, cors);
-          return;
-        }
-
-        const slidesRoot = path.resolve(resolveHomeDir(env), ".summarize", "slides");
-        const slidesDir = path.join(slidesRoot, sourceId);
-        const payloadPath = path.join(slidesDir, "slides.json");
-
-        const resolveFromDisk = async (): Promise<string | null> => {
-          const raw = await fs.readFile(payloadPath, "utf8").catch(() => null);
-          if (raw) {
-            try {
-              const parsed = JSON.parse(raw) as SlideExtractionResult;
-              const slide = parsed?.slides?.find?.((item) => item?.index === index);
-              if (slide?.imagePath) {
-                const resolved = resolveSlideImagePath(slidesDir, slide.imagePath);
-                if (resolved) return resolved;
-              }
-            } catch {
-              // fall through
-            }
-          }
-          const prefix = `slide_${String(index).padStart(4, "0")}`;
-          const entries = await fs.readdir(slidesDir).catch(() => null);
-          if (!entries) return null;
-          const candidates = entries
-            .filter((name) => name.startsWith(prefix) && name.endsWith(".png"))
-            .map((name) => path.join(slidesDir, name));
-          if (candidates.length === 0) return null;
-          let best: { filePath: string; mtimeMs: number } | null = null;
-          for (const filePath of candidates) {
-            const stat = await fs.stat(filePath).catch(() => null);
-            if (!stat?.isFile()) continue;
-            const mtimeMs = stat.mtimeMs;
-            if (!best || mtimeMs > best.mtimeMs) best = { filePath, mtimeMs };
-          }
-          return best?.filePath ?? null;
-        };
-
-        const filePath = await resolveFromDisk();
-        if (!filePath) {
-          // Return a tiny transparent PNG (placeholder) instead of 404 to avoid broken-image icons
-          // while extraction is still running.
-          const placeholder = Buffer.from(
-            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO3kq0cAAAAASUVORK5CYII=",
-            "base64",
-          );
-          res.writeHead(200, {
-            "content-type": "image/png",
-            "content-length": placeholder.length.toString(),
-            "cache-control": "no-store",
-            "x-summarize-slide-ready": "0",
-            ...cors,
-          });
-          res.end(placeholder);
-          return;
-        }
-
-        try {
-          const stat = await fs.stat(filePath);
-          res.writeHead(200, {
-            "content-type": "image/png",
-            "content-length": stat.size.toString(),
-            "cache-control": "no-store",
-            "x-summarize-slide-ready": "1",
-            ...cors,
-          });
-          const stream = createReadStream(filePath);
-          stream.pipe(res);
-          stream.on("error", () => res.end());
-        } catch {
-          json(res, 404, { ok: false, error: "not found" }, cors);
-        }
-        return;
-      }
-
-      const eventsMatch = pathname.match(/^\/v1\/summarize\/([^/]+)\/events$/);
-      if (req.method === "GET" && eventsMatch) {
-        const id = eventsMatch[1];
-        if (!id) {
-          json(res, 404, { ok: false }, cors);
-          return;
-        }
-        const session = sessions.get(id);
-        if (!session) {
-          json(res, 404, { ok: false, error: "not found" }, cors);
-          return;
-        }
-
-        attachBufferedSseSession({
-          res,
-          cors,
-          buffer: session.buffer,
-          clients: session.clients,
-          done: session.done,
-        });
-        return;
-      }
-
-      const slidesEventsMatch = pathname.match(/^\/v1\/summarize\/([^/]+)\/slides\/events$/);
-      if (req.method === "GET" && slidesEventsMatch) {
-        const id = slidesEventsMatch[1];
-        if (!id) {
-          json(res, 404, { ok: false }, cors);
-          return;
-        }
-        const session = sessions.get(id);
-        if (!session || !session.slidesRequested) {
-          json(res, 404, { ok: false, error: "not found" }, cors);
-          return;
-        }
-
-        attachBufferedSseSession({
-          res,
-          cors,
-          buffer: session.slidesBuffer,
-          clients: session.slidesClients,
-          done: session.slidesDone,
-          afterReplay: () => {
-            const hasSlidesEvent = session.slidesBuffer.some(
-              (entry) => entry.event.event === "slides",
-            );
-            if (!hasSlidesEvent && session.slides) {
-              res.write(
-                encodeSseEvent({
-                  event: "slides",
-                  data: buildSlidesPayload({ slides: session.slides, port }),
-                }),
-              );
-            }
-
-            const hasStatusEvent = session.slidesBuffer.some(
-              (entry) => entry.event.event === "status",
-            );
-            if (!hasStatusEvent && session.slidesLastStatus) {
-              res.write(
-                encodeSseEvent({ event: "status", data: { text: session.slidesLastStatus } }),
-              );
-            }
-          },
-        });
-        return;
-      }
-
-      const refreshEventsMatch = pathname.match(/^\/v1\/refresh-free\/([^/]+)\/events$/);
-      if (req.method === "GET" && refreshEventsMatch) {
-        const id = refreshEventsMatch[1];
-        if (!id) {
-          json(res, 404, { ok: false }, cors);
-          return;
-        }
-        const session = refreshSessions.get(id);
-        if (!session) {
-          json(res, 404, { ok: false, error: "not found" }, cors);
-          return;
-        }
-
-        attachBufferedSseSession({
-          res,
-          cors,
-          buffer: session.buffer,
-          clients: session.clients,
-          done: session.done,
-        });
+          env,
+          port,
+          sessions,
+          refreshSessions,
+        })
+      ) {
         return;
       }
 
