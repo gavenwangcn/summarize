@@ -1,13 +1,33 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { ExtractedLinkContent, MediaCache } from "../content/index.js";
 import { extractYouTubeVideoId, isDirectMediaUrl, isYouTubeUrl } from "../content/index.js";
-import type { ProcessHandle } from "../processes.js";
-import { spawnTracked } from "../processes.js";
 import { resolveExecutableInPath } from "../run/env.js";
+import { runOcrOnSlides } from "./ocr.js";
+import { runProcess, runProcessCapture, runWithConcurrency } from "./process.js";
+import {
+  adjustTimestampWithinSegment,
+  applyMaxSlidesFilter,
+  applyMinDurationFilter,
+  buildIntervalTimestamps,
+  buildSceneSegments,
+  buildSegments,
+  calibrateSceneThreshold,
+  clamp,
+  detectSceneTimestamps,
+  filterTimestampsByMinDuration,
+  findSceneSegment,
+  mergeTimestamps,
+  parseShowinfoTimestamp,
+  probeVideoInfo,
+  resolveExtractedTimestamp,
+  roundThreshold,
+  selectTimestampTargets,
+} from "./scene-detection.js";
 import type { SlideSettings } from "./settings.js";
+import { buildDirectSourceId, buildYoutubeSourceId } from "./source-id.js";
 import {
   buildSlidesDirId,
   readSlidesCacheIfValid,
@@ -22,10 +42,8 @@ import type {
   SlideSourceKind,
 } from "./types.js";
 
-const FFMPEG_TIMEOUT_FALLBACK_MS = 300_000;
 const slidesLocks = new Map<string, Promise<void>>();
 const YT_DLP_TIMEOUT_MS = 300_000;
-const TESSERACT_TIMEOUT_MS = 120_000;
 const DEFAULT_SLIDES_WORKERS = 8;
 const DEFAULT_SLIDES_SAMPLE_COUNT = 8;
 // Prefer broadly-decodable H.264/MP4 for ffmpeg stability.
@@ -34,6 +52,8 @@ const DEFAULT_YT_DLP_FORMAT_EXTRACT =
   "bestvideo[height<=720][vcodec^=avc1][ext=mp4]/best[height<=720][vcodec^=avc1][ext=mp4]/bestvideo[height<=720][ext=mp4]/best[height<=720]";
 
 type SlidesLogger = ((message: string) => void) | null;
+
+export { parseShowinfoTimestamp, resolveExtractedTimestamp };
 
 function createSlidesLogger(logger: SlidesLogger) {
   const logSlides = (message: string) => {
@@ -502,6 +522,9 @@ export async function extractSlidesForSource({
           }),
           settings.maxSlides,
           warnings,
+          (imagePath) => {
+            void fs.rm(imagePath, { force: true }).catch(() => {});
+          },
         );
 
         const timelineSlides: SlideExtractionResult = {
@@ -594,6 +617,9 @@ export async function extractSlidesForSource({
           extractedSlides,
           settings.minDurationSeconds,
           warnings,
+          (imagePath) => {
+            void fs.rm(imagePath, { force: true }).catch(() => {});
+          },
         );
 
         const renameStartedAt = Date.now();
@@ -677,41 +703,6 @@ export async function extractSlidesForSource({
       hooks?.onSlidesProgress?.("Slides: queued");
     },
   );
-}
-
-export function parseShowinfoTimestamp(line: string): number | null {
-  if (!line.includes("showinfo")) return null;
-  const match = /pts_time:(\d+\.?\d*)/.exec(line);
-  if (!match) return null;
-  const ts = Number(match[1]);
-  if (!Number.isFinite(ts)) return null;
-  return ts;
-}
-
-export function resolveExtractedTimestamp({
-  requested,
-  actual,
-  seekBase,
-}: {
-  requested: number;
-  actual: number | null;
-  seekBase?: number | null;
-}): number {
-  if (!Number.isFinite(requested)) return 0;
-  if (actual == null || !Number.isFinite(actual) || actual < 0) return requested;
-  const base =
-    typeof seekBase === "number" && Number.isFinite(seekBase) && seekBase > 0 ? seekBase : null;
-  if (!base) {
-    // With -ss before -i, showinfo PTS resets near 0. Treat small values as offsets.
-    if (actual <= 5) return requested + actual;
-    return actual;
-  }
-
-  const candidateRelative = base + actual;
-  const candidateAbsolute = actual;
-  const relativeDelta = Math.abs(candidateRelative - requested);
-  const absoluteDelta = Math.abs(candidateAbsolute - requested);
-  return relativeDelta <= absoluteDelta ? candidateRelative : candidateAbsolute;
 }
 
 async function prepareSlidesDir(slidesDir: string): Promise<void> {
@@ -992,12 +983,14 @@ async function detectSlideTimestamps({
   logSlidesTiming?: ((label: string, startedAt: number) => number) | null;
 }): Promise<{ timestamps: number[]; autoTune: SlideAutoTune; durationSeconds: number | null }> {
   const probeStartedAt = Date.now();
-  const videoInfo = await probeVideoInfo({
-    ffprobePath,
-    env,
-    inputPath,
-    timeoutMs,
-  });
+  const resolvedFfprobePath = ffprobePath ?? resolveExecutableInPath("ffprobe", env);
+  const videoInfo = resolvedFfprobePath
+    ? await probeVideoInfo({
+        ffprobePath: resolvedFfprobePath,
+        inputPath,
+        timeoutMs,
+      })
+    : { durationSeconds: null, width: null, height: null };
   logSlidesTiming?.("ffprobe video info", probeStartedAt);
 
   const calibration = await calibrateSceneThreshold({
@@ -1027,6 +1020,7 @@ async function detectSlideTimestamps({
     segments,
     workers,
     onSegmentProgress,
+    runWithConcurrency,
   });
   logSlidesTiming?.(
     `scene detection base (threshold=${effectiveThreshold}, segments=${segments.length})`,
@@ -1045,6 +1039,7 @@ async function detectSlideTimestamps({
         segments,
         workers,
         onSegmentProgress,
+        runWithConcurrency,
       });
       logSlidesTiming?.(
         `scene detection retry (threshold=${fallbackThreshold}, segments=${segments.length})`,
@@ -1418,742 +1413,6 @@ async function extractFramesAtTimestamps({
   return slides;
 }
 
-function clamp(value: number, min: number, max: number): number {
-  if (value < min) return min;
-  if (value > max) return max;
-  return value;
-}
-
-function buildCalibrationSampleTimestamps(
-  durationSeconds: number | null,
-  sampleCount: number,
-): number[] {
-  if (!durationSeconds || durationSeconds <= 0) return [0];
-  const clamped = Math.max(3, Math.min(12, Math.round(sampleCount)));
-  const startRatio = 0.05;
-  const endRatio = 0.95;
-  if (clamped === 1) {
-    return [clamp(durationSeconds * 0.5, 0, durationSeconds - 0.1)];
-  }
-  const step = (endRatio - startRatio) / (clamped - 1);
-  const points: number[] = [];
-  for (let i = 0; i < clamped; i += 1) {
-    const ratio = startRatio + step * i;
-    points.push(clamp(durationSeconds * ratio, 0, durationSeconds - 0.1));
-  }
-  return points;
-}
-
-function computeDiffStats(values: number[]): {
-  median: number;
-  p75: number;
-  p90: number;
-  max: number;
-} {
-  if (values.length === 0) {
-    return { median: 0, p75: 0, p90: 0, max: 0 };
-  }
-  const sorted = [...values].sort((a, b) => a - b);
-  const at = (p: number) => sorted[Math.min(sorted.length - 1, Math.max(0, Math.round(p)))] ?? 0;
-  const median = at((sorted.length - 1) * 0.5);
-  const p75 = at((sorted.length - 1) * 0.75);
-  const p90 = at((sorted.length - 1) * 0.9);
-  const max = sorted[sorted.length - 1] ?? 0;
-  return { median, p75, p90, max };
-}
-
-function roundThreshold(value: number): number {
-  return Math.round(value * 100) / 100;
-}
-
-async function calibrateSceneThreshold({
-  ffmpegPath,
-  inputPath,
-  durationSeconds,
-  sampleCount,
-  timeoutMs,
-  logSlides,
-}: {
-  ffmpegPath: string;
-  inputPath: string;
-  durationSeconds: number | null;
-  sampleCount: number;
-  timeoutMs: number;
-  logSlides?: ((message: string) => void) | null;
-}): Promise<{ threshold: number; confidence: number }> {
-  const timestamps = buildCalibrationSampleTimestamps(durationSeconds, sampleCount);
-  if (timestamps.length < 2) {
-    return { threshold: 0.2, confidence: 0 };
-  }
-
-  const hashes: Uint8Array[] = [];
-  for (const timestamp of timestamps) {
-    const hash = await hashFrameAtTimestamp({
-      ffmpegPath,
-      inputPath,
-      timestamp,
-      timeoutMs,
-    });
-    if (hash) hashes.push(hash);
-  }
-
-  const diffs: number[] = [];
-  for (let i = 1; i < hashes.length; i += 1) {
-    const diff = computeHashDistanceRatio(hashes[i - 1], hashes[i]);
-    diffs.push(diff);
-  }
-
-  const stats = computeDiffStats(diffs);
-  const scaledMedian = stats.median * 0.15;
-  const scaledP75 = stats.p75 * 0.2;
-  const scaledP90 = stats.p90 * 0.25;
-  let threshold = roundThreshold(Math.max(scaledMedian, scaledP75, scaledP90));
-  if (stats.p75 >= 0.12) {
-    threshold = Math.min(threshold, 0.05);
-  } else if (stats.p90 < 0.05) {
-    threshold = 0.05;
-  }
-  threshold = clamp(threshold, 0.05, 0.3);
-  const confidence =
-    diffs.length >= 2 ? clamp(stats.p75 / 0.25, 0, 1) : clamp(stats.max / 0.25, 0, 1);
-  logSlides?.(
-    `calibration samples=${timestamps.length} diffs=${diffs.length} median=${stats.median.toFixed(
-      3,
-    )} p75=${stats.p75.toFixed(3)} threshold=${threshold}`,
-  );
-  return { threshold, confidence };
-}
-
-function buildSegments(
-  durationSeconds: number | null,
-  workers: number,
-): Array<{ start: number; duration: number }> {
-  if (!durationSeconds || durationSeconds <= 0 || workers <= 1) {
-    return [{ start: 0, duration: durationSeconds ?? 0 }];
-  }
-  const clampedWorkers = Math.max(1, Math.min(16, Math.round(workers)));
-  const segmentCount = Math.min(clampedWorkers, Math.ceil(durationSeconds / 60));
-  const segmentDuration = durationSeconds / segmentCount;
-  const segments: Array<{ start: number; duration: number }> = [];
-  for (let i = 0; i < segmentCount; i += 1) {
-    const start = i * segmentDuration;
-    const remaining = durationSeconds - start;
-    const duration = i === segmentCount - 1 ? remaining : segmentDuration;
-    segments.push({ start, duration });
-  }
-  return segments;
-}
-
-async function detectSceneTimestamps({
-  ffmpegPath,
-  inputPath,
-  threshold,
-  timeoutMs,
-  segments,
-  workers,
-  onSegmentProgress,
-}: {
-  ffmpegPath: string;
-  inputPath: string;
-  threshold: number;
-  timeoutMs: number;
-  segments?: Array<{ start: number; duration: number }>;
-  workers?: number;
-  onSegmentProgress?: ((completed: number, total: number) => void) | null;
-}): Promise<number[]> {
-  const filter = `select='gt(scene,${threshold})',showinfo`;
-  const defaultSegments = [{ start: 0, duration: 0 }];
-  const usedSegments = segments && segments.length > 0 ? segments : defaultSegments;
-  const concurrency = workers && workers > 0 ? workers : 1;
-
-  const tasks = usedSegments.map((segment) => async () => {
-    const args = [
-      "-hide_banner",
-      ...(segment.duration > 0
-        ? ["-ss", String(segment.start), "-t", String(segment.duration)]
-        : []),
-      "-i",
-      inputPath,
-      "-vf",
-      filter,
-      "-fps_mode",
-      "vfr",
-      "-an",
-      "-sn",
-      "-f",
-      "null",
-      "-",
-    ];
-    const timestamps: number[] = [];
-    await runProcess({
-      command: ffmpegPath,
-      args,
-      timeoutMs: Math.max(timeoutMs, FFMPEG_TIMEOUT_FALLBACK_MS),
-      errorLabel: "ffmpeg",
-      onStderrLine: (line) => {
-        const ts = parseShowinfoTimestamp(line);
-        if (ts != null) timestamps.push(ts + segment.start);
-      },
-    });
-    return timestamps;
-  });
-
-  const results = await runWithConcurrency(tasks, concurrency, onSegmentProgress ?? undefined);
-  const merged = results.flat();
-  merged.sort((a, b) => a - b);
-  return merged;
-}
-
-async function hashFrameAtTimestamp({
-  ffmpegPath,
-  inputPath,
-  timestamp,
-  timeoutMs,
-}: {
-  ffmpegPath: string;
-  inputPath: string;
-  timestamp: number;
-  timeoutMs: number;
-}): Promise<Uint8Array | null> {
-  const filter = "scale=32:32,format=gray";
-  const args = [
-    "-hide_banner",
-    "-ss",
-    String(timestamp),
-    "-i",
-    inputPath,
-    "-frames:v",
-    "1",
-    "-vf",
-    filter,
-    "-f",
-    "rawvideo",
-    "-pix_fmt",
-    "gray",
-    "-",
-  ];
-  try {
-    const buffer = await runProcessCaptureBuffer({
-      command: ffmpegPath,
-      args,
-      timeoutMs,
-      errorLabel: "ffmpeg",
-    });
-    if (buffer.length < 1024) return null;
-    const bytes = buffer.subarray(0, 1024);
-    return buildAverageHash(bytes);
-  } catch {
-    return null;
-  }
-}
-
-function buildAverageHash(pixels: Uint8Array): Uint8Array {
-  let sum = 0;
-  for (const value of pixels) sum += value;
-  const avg = sum / pixels.length;
-  const bits = new Uint8Array(pixels.length);
-  for (let i = 0; i < pixels.length; i += 1) {
-    bits[i] = pixels[i] >= avg ? 1 : 0;
-  }
-  return bits;
-}
-
-function computeHashDistanceRatio(a: Uint8Array, b: Uint8Array): number {
-  const len = Math.min(a.length, b.length);
-  let diff = 0;
-  for (let i = 0; i < len; i += 1) {
-    if (a[i] !== b[i]) diff += 1;
-  }
-  return len === 0 ? 0 : diff / len;
-}
-
-async function probeVideoInfo({
-  ffprobePath,
-  env,
-  inputPath,
-  timeoutMs,
-}: {
-  ffprobePath: string | null;
-  env: Record<string, string | undefined>;
-  inputPath: string;
-  timeoutMs: number;
-}): Promise<{ durationSeconds: number | null; width: number | null; height: number | null }> {
-  const probeBin = ffprobePath ?? resolveExecutableInPath("ffprobe", env);
-  if (!probeBin) return { durationSeconds: null, width: null, height: null };
-  const args = ["-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", inputPath];
-  try {
-    const output = await runProcessCapture({
-      command: probeBin,
-      args,
-      timeoutMs: Math.min(timeoutMs, 30_000),
-      errorLabel: "ffprobe",
-    });
-    const parsed = JSON.parse(output) as {
-      streams?: Array<{
-        codec_type?: string;
-        duration?: string | number;
-        width?: number;
-        height?: number;
-      }>;
-      format?: { duration?: string | number };
-    };
-    let durationSeconds: number | null = null;
-    let width: number | null = null;
-    let height: number | null = null;
-    for (const stream of parsed.streams ?? []) {
-      if (stream.codec_type === "video") {
-        if (width == null && typeof stream.width === "number") width = stream.width;
-        if (height == null && typeof stream.height === "number") height = stream.height;
-        const duration = Number(stream.duration);
-        if (Number.isFinite(duration) && duration > 0) durationSeconds = duration;
-      }
-    }
-    if (durationSeconds == null) {
-      const formatDuration = Number(parsed.format?.duration);
-      if (Number.isFinite(formatDuration) && formatDuration > 0) durationSeconds = formatDuration;
-    }
-    return { durationSeconds, width, height };
-  } catch {
-    return { durationSeconds: null, width: null, height: null };
-  }
-}
-
-async function runProcess({
-  command,
-  args,
-  timeoutMs,
-  errorLabel,
-  onStderrLine,
-  onStdoutLine,
-}: {
-  command: string;
-  args: string[];
-  timeoutMs: number;
-  errorLabel: string;
-  onStderrLine?: (line: string, handle: ProcessHandle | null) => void;
-  onStdoutLine?: (line: string, handle: ProcessHandle | null) => void;
-}): Promise<void> {
-  await new Promise<void>((resolve, reject) => {
-    const { proc, handle } = spawnTracked(command, args, {
-      stdio: ["ignore", "pipe", "pipe"],
-      label: errorLabel,
-      kind: errorLabel,
-      captureOutput: false,
-    });
-    let stderr = "";
-    let stderrBuffer = "";
-    let stdoutBuffer = "";
-
-    const flushLine = (line: string) => {
-      if (onStderrLine) onStderrLine(line, handle);
-      handle?.appendOutput("stderr", line);
-      if (stderr.length < 8192) {
-        stderr += line;
-        if (!line.endsWith("\n")) stderr += "\n";
-      }
-    };
-
-    if (proc.stderr) {
-      proc.stderr.setEncoding("utf8");
-      proc.stderr.on("data", (chunk: string) => {
-        stderrBuffer += chunk;
-        const lines = stderrBuffer.split(/\r?\n/);
-        stderrBuffer = lines.pop() ?? "";
-        for (const line of lines) {
-          if (line) flushLine(line);
-        }
-      });
-    }
-
-    if (proc.stdout) {
-      const handleStdoutLine = onStdoutLine ?? onStderrLine;
-      if (handleStdoutLine) {
-        proc.stdout.setEncoding("utf8");
-        proc.stdout.on("data", (chunk: string) => {
-          stdoutBuffer += chunk;
-          const lines = stdoutBuffer.split(/\r?\n/);
-          stdoutBuffer = lines.pop() ?? "";
-          for (const line of lines) {
-            if (!line) continue;
-            handleStdoutLine(line, handle);
-            handle?.appendOutput("stdout", line);
-          }
-        });
-      }
-    }
-
-    const timeout = setTimeout(() => {
-      proc.kill("SIGKILL");
-      reject(new Error(`${errorLabel} timed out`));
-    }, timeoutMs);
-
-    proc.on("error", (error) => {
-      clearTimeout(timeout);
-      reject(error);
-    });
-
-    proc.on("close", (code) => {
-      clearTimeout(timeout);
-      if (stderrBuffer.trim().length > 0) {
-        flushLine(stderrBuffer.trim());
-      }
-      if (stdoutBuffer.trim().length > 0) {
-        const handleStdoutLine = onStdoutLine ?? onStderrLine;
-        if (handleStdoutLine) handleStdoutLine(stdoutBuffer.trim(), handle);
-        handle?.appendOutput("stdout", stdoutBuffer.trim());
-      }
-      if (code === 0) {
-        resolve();
-        return;
-      }
-      const suffix = stderr.trim() ? `: ${stderr.trim()}` : "";
-      reject(new Error(`${errorLabel} exited with code ${code}${suffix}`));
-    });
-  });
-}
-
-function applyMinDurationFilter(
-  slides: SlideImage[],
-  minDurationSeconds: number,
-  warnings: string[],
-): SlideImage[] {
-  if (minDurationSeconds <= 0) return slides;
-  const filtered: SlideImage[] = [];
-  let lastTimestamp = -Infinity;
-  for (const slide of slides) {
-    if (slide.timestamp - lastTimestamp >= minDurationSeconds) {
-      filtered.push(slide);
-      lastTimestamp = slide.timestamp;
-    } else {
-      void fs.rm(slide.imagePath, { force: true }).catch(() => {});
-    }
-  }
-  if (filtered.length < slides.length) {
-    warnings.push(`Filtered ${slides.length - filtered.length} slides by min duration`);
-  }
-  return filtered.map((slide, index) => ({ ...slide, index: index + 1 }));
-}
-
-function mergeTimestamps(
-  sceneTimestamps: number[],
-  intervalTimestamps: number[],
-  minDurationSeconds: number,
-): number[] {
-  const merged = [...sceneTimestamps, ...intervalTimestamps].filter((value) =>
-    Number.isFinite(value),
-  );
-  merged.sort((a, b) => a - b);
-  if (merged.length === 0) return [];
-  const result: number[] = [];
-  const minGap = Math.max(0.1, minDurationSeconds * 0.5);
-  for (const ts of merged) {
-    if (result.length === 0 || ts - result[result.length - 1] >= minGap) {
-      result.push(ts);
-    }
-  }
-  return result;
-}
-
-function filterTimestampsByMinDuration(timestamps: number[], minDurationSeconds: number): number[] {
-  if (minDurationSeconds <= 0) return timestamps.slice();
-  const sorted = timestamps
-    .filter((value) => Number.isFinite(value))
-    .slice()
-    .sort((a, b) => a - b);
-  const filtered: number[] = [];
-  let lastTimestamp = -Infinity;
-  for (const ts of sorted) {
-    if (ts - lastTimestamp >= minDurationSeconds) {
-      filtered.push(ts);
-      lastTimestamp = ts;
-    }
-  }
-  return filtered;
-}
-
-type SceneSegment = { start: number; end: number | null };
-
-function buildSceneSegments(
-  sceneTimestamps: number[],
-  durationSeconds: number | null,
-): SceneSegment[] {
-  const sorted = sceneTimestamps
-    .filter((value) => Number.isFinite(value) && value >= 0)
-    .slice()
-    .sort((a, b) => a - b);
-  const deduped: number[] = [];
-  for (const ts of sorted) {
-    if (deduped.length === 0 || ts - deduped[deduped.length - 1] > 0.05) {
-      deduped.push(ts);
-    }
-  }
-  const starts = [0, ...deduped];
-  const ends = [...deduped, durationSeconds];
-  const segments: SceneSegment[] = [];
-  for (let i = 0; i < starts.length; i += 1) {
-    const start = starts[i];
-    const rawEnd = ends[i];
-    const end =
-      typeof rawEnd === "number" && Number.isFinite(rawEnd) && rawEnd > start ? rawEnd : null;
-    segments.push({ start, end });
-  }
-  return segments;
-}
-
-function findSceneSegment(segments: SceneSegment[], timestamp: number): SceneSegment | null {
-  if (segments.length === 0) return null;
-  for (const segment of segments) {
-    if (timestamp >= segment.start && (segment.end == null || timestamp < segment.end)) {
-      return segment;
-    }
-  }
-  return segments[segments.length - 1] ?? null;
-}
-
-function adjustTimestampWithinSegment(timestamp: number, segment: SceneSegment | null): number {
-  if (!segment) return timestamp;
-  const start = Math.max(0, segment.start);
-  const end = segment.end;
-  if (end == null || !Number.isFinite(end) || end <= start) {
-    return Math.max(timestamp, start);
-  }
-  const duration = Math.max(0, end - start);
-  const padding = Math.min(1.5, Math.max(0.2, duration * 0.08));
-  if (duration <= padding * 2) {
-    return start + duration * 0.5;
-  }
-  return clamp(timestamp, start + padding, end - padding);
-}
-
-function selectTimestampTargets({
-  targets,
-  sceneTimestamps,
-  minDurationSeconds,
-  intervalSeconds,
-}: {
-  targets: number[];
-  sceneTimestamps: number[];
-  minDurationSeconds: number;
-  intervalSeconds: number;
-}): number[] {
-  const targetList = targets
-    .filter((value) => Number.isFinite(value))
-    .slice()
-    .sort((a, b) => a - b);
-  if (targetList.length === 0) return [];
-
-  const sceneList = filterTimestampsByMinDuration(
-    sceneTimestamps,
-    Math.max(0.1, minDurationSeconds * 0.25),
-  );
-  const windowSeconds = Math.max(2, Math.min(10, intervalSeconds * 0.35));
-
-  const picked: number[] = [];
-  let lastPicked = -Infinity;
-  let sceneIndex = 0;
-  for (const target of targetList) {
-    while (sceneIndex < sceneList.length && sceneList[sceneIndex] < target - windowSeconds) {
-      sceneIndex += 1;
-    }
-
-    let best: number | null = null;
-    let bestDiff = Number.POSITIVE_INFINITY;
-    for (let idx = sceneIndex; idx < sceneList.length; idx += 1) {
-      const candidate = sceneList[idx];
-      if (candidate > target + windowSeconds) break;
-      const diff = Math.abs(candidate - target);
-      if (diff < bestDiff) {
-        best = candidate;
-        bestDiff = diff;
-      }
-    }
-
-    const candidate = best ?? target;
-    const chosen = candidate - lastPicked >= minDurationSeconds ? candidate : target;
-    picked.push(chosen);
-    lastPicked = chosen;
-  }
-
-  return picked;
-}
-
-function buildIntervalTimestamps({
-  durationSeconds,
-  minDurationSeconds,
-  maxSlides,
-}: {
-  durationSeconds: number | null;
-  minDurationSeconds: number;
-  maxSlides: number;
-}): { timestamps: number[]; intervalSeconds: number } | null {
-  if (!durationSeconds || durationSeconds <= 0) return null;
-  const maxCount = Math.max(1, Math.floor(maxSlides));
-  const targetCount = Math.min(maxCount, clamp(Math.round(durationSeconds / 180), 6, 20));
-  const intervalSeconds = Math.max(minDurationSeconds, durationSeconds / targetCount);
-  if (!Number.isFinite(intervalSeconds) || intervalSeconds <= 0) return null;
-  const timestamps: number[] = [];
-  for (let t = 0; t < durationSeconds; t += intervalSeconds) {
-    timestamps.push(t);
-  }
-  return { timestamps, intervalSeconds };
-}
-
-async function runProcessCapture({
-  command,
-  args,
-  timeoutMs,
-  errorLabel,
-}: {
-  command: string;
-  args: string[];
-  timeoutMs: number;
-  errorLabel: string;
-}): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const { proc, handle } = spawnTracked(command, args, {
-      stdio: ["ignore", "pipe", "pipe"],
-      label: errorLabel,
-      kind: errorLabel,
-      captureOutput: false,
-    });
-    let stdout = "";
-    let stderr = "";
-    let stdoutBuffer = "";
-    let stderrBuffer = "";
-
-    const timeout = setTimeout(() => {
-      proc.kill("SIGKILL");
-      reject(new Error(`${errorLabel} timed out`));
-    }, timeoutMs);
-
-    if (proc.stdout) {
-      proc.stdout.setEncoding("utf8");
-      proc.stdout.on("data", (chunk: string) => {
-        stdout += chunk;
-        stdoutBuffer += chunk;
-        const lines = stdoutBuffer.split(/\r?\n/);
-        stdoutBuffer = lines.pop() ?? "";
-        for (const line of lines) {
-          if (line) handle?.appendOutput("stdout", line);
-        }
-      });
-    }
-    if (proc.stderr) {
-      proc.stderr.setEncoding("utf8");
-      proc.stderr.on("data", (chunk: string) => {
-        if (stderr.length < 8192) {
-          stderr += chunk;
-        }
-        stderrBuffer += chunk;
-        const lines = stderrBuffer.split(/\r?\n/);
-        stderrBuffer = lines.pop() ?? "";
-        for (const line of lines) {
-          if (line) handle?.appendOutput("stderr", line);
-        }
-      });
-    }
-
-    proc.on("error", (error) => {
-      clearTimeout(timeout);
-      reject(error);
-    });
-
-    proc.on("close", (code) => {
-      clearTimeout(timeout);
-      if (stdoutBuffer.trim()) handle?.appendOutput("stdout", stdoutBuffer.trim());
-      if (stderrBuffer.trim()) handle?.appendOutput("stderr", stderrBuffer.trim());
-      if (code === 0) {
-        resolve(stdout);
-        return;
-      }
-      const suffix = stderr.trim() ? `: ${stderr.trim()}` : "";
-      reject(new Error(`${errorLabel} exited with code ${code}${suffix}`));
-    });
-  });
-}
-
-async function runProcessCaptureBuffer({
-  command,
-  args,
-  timeoutMs,
-  errorLabel,
-}: {
-  command: string;
-  args: string[];
-  timeoutMs: number;
-  errorLabel: string;
-}): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const { proc, handle } = spawnTracked(command, args, {
-      stdio: ["ignore", "pipe", "pipe"],
-      label: errorLabel,
-      kind: errorLabel,
-      captureOutput: false,
-    });
-    const chunks: Buffer[] = [];
-    let stderr = "";
-    let stderrBuffer = "";
-
-    const timeout = setTimeout(() => {
-      proc.kill("SIGKILL");
-      reject(new Error(`${errorLabel} timed out`));
-    }, timeoutMs);
-
-    if (proc.stdout) {
-      proc.stdout.on("data", (chunk: Buffer) => {
-        chunks.push(chunk);
-      });
-    }
-    if (proc.stderr) {
-      proc.stderr.setEncoding("utf8");
-      proc.stderr.on("data", (chunk: string) => {
-        if (stderr.length < 8192) {
-          stderr += chunk;
-        }
-        stderrBuffer += chunk;
-        const lines = stderrBuffer.split(/\r?\n/);
-        stderrBuffer = lines.pop() ?? "";
-        for (const line of lines) {
-          if (line) handle?.appendOutput("stderr", line);
-        }
-      });
-    }
-
-    proc.on("error", (error) => {
-      clearTimeout(timeout);
-      reject(error);
-    });
-
-    proc.on("close", (code) => {
-      clearTimeout(timeout);
-      if (stderrBuffer.trim()) handle?.appendOutput("stderr", stderrBuffer.trim());
-      if (code === 0) {
-        resolve(Buffer.concat(chunks));
-        return;
-      }
-      const suffix = stderr.trim() ? `: ${stderr.trim()}` : "";
-      reject(new Error(`${errorLabel} exited with code ${code}${suffix}`));
-    });
-  });
-}
-
-function applyMaxSlidesFilter<T extends { index: number; timestamp: number; imagePath: string }>(
-  slides: T[],
-  maxSlides: number,
-  warnings: string[],
-): T[] {
-  if (maxSlides <= 0 || slides.length <= maxSlides) return slides;
-  const kept = slides.slice(0, maxSlides);
-  const removed = slides.slice(maxSlides);
-  for (const slide of removed) {
-    if (slide.imagePath) {
-      void fs.rm(slide.imagePath, { force: true }).catch(() => {});
-    }
-  }
-  warnings.push(`Trimmed slides to max ${maxSlides}`);
-  return kept.map((slide, index) => ({ ...slide, index: index + 1 }));
-}
-
 async function renameSlidesWithTimestamps(
   slides: SlideImage[],
   slidesDir: string,
@@ -2197,135 +1456,6 @@ async function withSlidesLock<T>(
   }
 }
 
-async function runWithConcurrency<T>(
-  tasks: Array<() => Promise<T>>,
-  workers: number,
-  onProgress?: ((completed: number, total: number) => void) | null,
-): Promise<T[]> {
-  if (tasks.length === 0) return [];
-  const concurrency = Math.max(1, Math.min(16, Math.round(workers)));
-  const results: T[] = new Array(tasks.length);
-  const total = tasks.length;
-  let completed = 0;
-  let nextIndex = 0;
-
-  const worker = async () => {
-    while (true) {
-      const current = nextIndex;
-      if (current >= tasks.length) return;
-      nextIndex += 1;
-      try {
-        results[current] = await tasks[current]();
-      } finally {
-        completed += 1;
-        onProgress?.(completed, total);
-      }
-    }
-  };
-
-  const runners = Array.from({ length: Math.min(concurrency, tasks.length) }, () => worker());
-  await Promise.all(runners);
-  return results;
-}
-
-async function runOcrOnSlides(
-  slides: SlideImage[],
-  tesseractPath: string,
-  workers: number,
-  onProgress?: ((completed: number, total: number) => void) | null,
-): Promise<SlideImage[]> {
-  const tasks = slides.map((slide) => async () => {
-    try {
-      const text = await runTesseract(tesseractPath, slide.imagePath);
-      const cleaned = cleanOcrText(text);
-      return {
-        ...slide,
-        ocrText: cleaned,
-        ocrConfidence: estimateOcrConfidence(cleaned),
-      };
-    } catch {
-      return { ...slide, ocrText: "", ocrConfidence: 0 };
-    }
-  });
-  const results = await runWithConcurrency(tasks, workers, onProgress ?? undefined);
-  return results.sort((a, b) => a.index - b.index);
-}
-
-async function runTesseract(tesseractPath: string, imagePath: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const args = [imagePath, "stdout", "--oem", "3", "--psm", "6"];
-    const { proc, handle } = spawnTracked(tesseractPath, args, {
-      stdio: ["ignore", "pipe", "pipe"],
-      label: "tesseract",
-      kind: "tesseract",
-      captureOutput: false,
-    });
-    let stdout = "";
-    let stderr = "";
-    let stderrBuffer = "";
-
-    const timeout = setTimeout(() => {
-      proc.kill("SIGKILL");
-      reject(new Error("tesseract timed out"));
-    }, TESSERACT_TIMEOUT_MS);
-
-    if (proc.stdout) {
-      proc.stdout.setEncoding("utf8");
-      proc.stdout.on("data", (chunk: string) => {
-        stdout += chunk;
-      });
-    }
-    if (proc.stderr) {
-      proc.stderr.setEncoding("utf8");
-      proc.stderr.on("data", (chunk: string) => {
-        if (stderr.length < 8192) {
-          stderr += chunk;
-        }
-        stderrBuffer += chunk;
-        const lines = stderrBuffer.split(/\r?\n/);
-        stderrBuffer = lines.pop() ?? "";
-        for (const line of lines) {
-          if (line) handle?.appendOutput("stderr", line);
-        }
-      });
-    }
-
-    proc.on("error", (error) => {
-      clearTimeout(timeout);
-      reject(error);
-    });
-
-    proc.on("close", (code) => {
-      clearTimeout(timeout);
-      if (stderrBuffer.trim()) handle?.appendOutput("stderr", stderrBuffer.trim());
-      if (code === 0) {
-        resolve(stdout);
-        return;
-      }
-      const suffix = stderr.trim() ? `: ${stderr.trim()}` : "";
-      reject(new Error(`tesseract exited with code ${code}${suffix}`));
-    });
-  });
-}
-
-function cleanOcrText(text: string): string {
-  const lines = text
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((line) => line.length >= 2)
-    .filter((line) => !(line.length > 20 && !line.includes(" ")))
-    .filter((line) => /[a-z0-9]/i.test(line));
-  return lines.join("\n");
-}
-
-function estimateOcrConfidence(text: string): number {
-  if (!text) return 0;
-  const total = text.length;
-  if (total === 0) return 0;
-  const alnum = Array.from(text).filter((char) => /[a-z0-9]/i.test(char)).length;
-  return Math.min(1, alnum / total);
-}
-
 async function writeSlidesJson(result: SlideExtractionResult, slidesDir: string): Promise<void> {
   const slidesDirId = result.slidesDirId ?? buildSlidesDirId(slidesDir);
   const payload = {
@@ -2349,46 +1479,4 @@ async function writeSlidesJson(result: SlideExtractionResult, slidesDir: string)
     })),
   };
   await fs.writeFile(path.join(slidesDir, "slides.json"), JSON.stringify(payload, null, 2), "utf8");
-}
-
-function buildDirectSourceId(url: string): string {
-  const parsed = (() => {
-    try {
-      return new URL(url);
-    } catch {
-      return null;
-    }
-  })();
-  const hostSlug = resolveHostSlug(parsed);
-  const rawName = parsed ? path.basename(parsed.pathname) : "video";
-  const base = rawName.replace(/\.[a-z0-9]+$/i, "").trim() || "video";
-  const slug = toSlug(base);
-  const combined = [hostSlug, slug].filter(Boolean).join("-");
-  const hash = createHash("sha1").update(url).digest("hex").slice(0, 8);
-  return combined ? `${combined}-${hash}` : `video-${hash}`;
-}
-
-function buildYoutubeSourceId(videoId: string): string {
-  return `youtube-${videoId}`;
-}
-
-function resolveHostSlug(parsed: URL | null): string | null {
-  if (!parsed?.hostname) return null;
-  const host = parsed.hostname.toLowerCase();
-  if (host === "youtube.com" || host.endsWith(".youtube.com") || host === "youtu.be") {
-    return "youtube";
-  }
-  const slug = toSlug(host);
-  return slug || null;
-}
-
-function toSlug(value: string): string {
-  const normalized = value
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
-  if (!normalized) return "";
-  const max = 64;
-  if (normalized.length <= max) return normalized;
-  return normalized.slice(0, max).replace(/-+$/g, "");
 }

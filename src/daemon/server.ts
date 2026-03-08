@@ -29,54 +29,35 @@ import {
   ProcessRegistry,
 } from "./process-registry.js";
 import {
+  clampNumber,
+  corsHeaders,
+  json,
+  readBearerToken,
+  readCorsHeaders,
+  readJsonBody,
+  text,
+  wantsJsonResponse,
+} from "./server-http.js";
+import {
+  createSession,
+  emitMeta,
+  emitSlides,
+  emitSlidesDone,
+  emitSlidesStatus,
+  endSession,
+  pushSlidesToSession,
+  pushToSession,
+  scheduleSessionCleanup,
+  type Session,
+  type SessionEvent,
+} from "./server-session.js";
+import {
   extractContentForUrl,
   streamSummaryForUrl,
   streamSummaryForVisiblePage,
 } from "./summarize.js";
 
-type SessionEvent = SseEvent;
-
-type Session = {
-  id: string;
-  createdAtMs: number;
-  buffer: Array<{ event: SessionEvent; bytes: number }>;
-  bufferBytes: number;
-  done: boolean;
-  clients: Set<http.ServerResponse>;
-  slidesBuffer: Array<{ event: SessionEvent; bytes: number }>;
-  slidesBufferBytes: number;
-  slidesClients: Set<http.ServerResponse>;
-  slidesDone: boolean;
-  slidesRequested: boolean;
-  slidesLastStatus: string | null;
-  lastMeta: {
-    model: string | null;
-    modelLabel: string | null;
-    inputSummary: string | null;
-    summaryFromCache: boolean | null;
-  };
-  slides: SlideExtractionResult | null;
-};
-
-function json(
-  res: http.ServerResponse,
-  status: number,
-  payload: unknown,
-  headers?: Record<string, string>,
-) {
-  const body = `${JSON.stringify(payload)}\n`;
-  res.writeHead(status, {
-    "content-type": "application/json; charset=utf-8",
-    "content-length": Buffer.byteLength(body).toString(),
-    ...headers,
-  });
-  res.end(body);
-}
-
-function clampNumber(value: number, min: number, max: number): number {
-  if (!Number.isFinite(value)) return min;
-  return Math.max(min, Math.min(max, value));
-}
+export { corsHeaders, isTrustedOrigin } from "./server-http.js";
 
 async function readLogTail({
   filePath,
@@ -114,92 +95,6 @@ async function readLogTail({
   }
 }
 
-function text(
-  res: http.ServerResponse,
-  status: number,
-  body: string,
-  headers?: Record<string, string>,
-) {
-  const out = body.endsWith("\n") ? body : `${body}\n`;
-  res.writeHead(status, {
-    "content-type": "text/plain; charset=utf-8",
-    "content-length": Buffer.byteLength(out).toString(),
-    ...headers,
-  });
-  res.end(out);
-}
-
-function resolveOriginHeader(req: http.IncomingMessage): string | null {
-  const origin = req.headers.origin;
-  if (typeof origin !== "string") return null;
-  if (!origin.trim()) return null;
-  return origin;
-}
-
-/**
- * Returns true when the origin is a browser-extension or localhost URL that
- * the daemon is expected to serve.  Arbitrary web origins are rejected to
- * prevent cross-site requests from untrusted pages (CWE-942).
- */
-export function isTrustedOrigin(origin: string): boolean {
-  // Browser extensions (Chrome, Firefox, Safari, Edge)
-  if (/^(?:chrome-extension|moz-extension|safari-web-extension):\/\//i.test(origin)) return true;
-  try {
-    const parsed = new URL(origin);
-    const host = parsed.hostname;
-    // localhost / 127.0.0.1 / [::1]
-    if (host === "localhost" || host === "127.0.0.1" || host === "[::1]") return true;
-  } catch {
-    // malformed origin
-  }
-  return false;
-}
-
-export function corsHeaders(origin: string | null): Record<string, string> {
-  if (!origin || !isTrustedOrigin(origin)) return {};
-  return {
-    "access-control-allow-origin": origin,
-    "access-control-allow-credentials": "true",
-    "access-control-allow-headers": "authorization, content-type",
-    "access-control-allow-methods": "GET,POST,OPTIONS",
-    // Chrome Private Network Access (PNA): allow requests to localhost from secure contexts.
-    // Without this, extensions often fail with a generic "Failed to fetch".
-    "access-control-allow-private-network": "true",
-    "access-control-max-age": "600",
-    vary: "Origin",
-  };
-}
-
-function readBearerToken(req: http.IncomingMessage): string | null {
-  const header = req.headers.authorization;
-  if (typeof header !== "string") return null;
-  const m = header.match(/^Bearer\s+(.+)\s*$/i);
-  return m?.[1]?.trim() || null;
-}
-
-async function readJsonBody(req: http.IncomingMessage, maxBytes: number): Promise<unknown> {
-  const chunks: Buffer[] = [];
-  let total = 0;
-  for await (const chunk of req) {
-    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-    total += buf.byteLength;
-    if (total > maxBytes) throw new Error(`Body too large (>${maxBytes} bytes)`);
-    chunks.push(buf);
-  }
-  const text = Buffer.concat(chunks).toString("utf8");
-  return JSON.parse(text);
-}
-
-function wantsJsonResponse(req: http.IncomingMessage, url: URL): boolean {
-  const format = url.searchParams.get("format");
-  if (format && format.toLowerCase() === "json") return true;
-  const accept = req.headers.accept;
-  if (typeof accept !== "string") return false;
-  const lower = accept.toLowerCase();
-  if (lower.includes("text/event-stream")) return false;
-  return lower.includes("application/json");
-}
-
 function parseDiagnostics(raw: unknown): { includeContent: boolean } {
   if (!raw || typeof raw !== "object") {
     return { includeContent: false };
@@ -229,140 +124,6 @@ function createLineWriter(onLine: (line: string) => void) {
       callback();
     },
   });
-}
-
-function createSession(): Session {
-  return {
-    id: randomUUID(),
-    createdAtMs: Date.now(),
-    buffer: [],
-    bufferBytes: 0,
-    done: false,
-    clients: new Set(),
-    slidesBuffer: [],
-    slidesBufferBytes: 0,
-    slidesClients: new Set(),
-    slidesDone: false,
-    slidesRequested: false,
-    slidesLastStatus: null,
-    lastMeta: { model: null, modelLabel: null, inputSummary: null, summaryFromCache: null },
-    slides: null,
-  };
-}
-
-const MAX_SESSION_BUFFER_EVENTS = 2000;
-const MAX_SESSION_BUFFER_BYTES = 512 * 1024;
-const MAX_SLIDES_BUFFER_EVENTS = 600;
-const MAX_SLIDES_BUFFER_BYTES = 256 * 1024;
-const MAX_SESSION_LIFETIME_MS = 30 * 60_000;
-
-function pushToSession(
-  session: Session,
-  evt: SessionEvent,
-  onSessionEvent?: ((event: SessionEvent, sessionId: string) => void) | null,
-) {
-  const encoded = encodeSseEvent(evt);
-  for (const res of session.clients) {
-    res.write(encoded);
-  }
-  onSessionEvent?.(evt, session.id);
-  const bytes = Buffer.byteLength(encoded);
-  session.buffer.push({ event: evt, bytes });
-  session.bufferBytes += bytes;
-  while (
-    session.buffer.length > MAX_SESSION_BUFFER_EVENTS ||
-    session.bufferBytes > MAX_SESSION_BUFFER_BYTES
-  ) {
-    const removed = session.buffer.shift();
-    if (!removed) break;
-    session.bufferBytes -= removed.bytes;
-  }
-  if (evt.event === "done" || evt.event === "error") {
-    session.done = true;
-  }
-}
-
-function pushSlidesToSession(
-  session: Session,
-  evt: SessionEvent,
-  onSessionEvent?: ((event: SessionEvent, sessionId: string) => void) | null,
-) {
-  const encoded = encodeSseEvent(evt);
-  for (const res of session.slidesClients) {
-    res.write(encoded);
-  }
-  onSessionEvent?.(evt, session.id);
-  const bytes = Buffer.byteLength(encoded);
-  session.slidesBuffer.push({ event: evt, bytes });
-  session.slidesBufferBytes += bytes;
-  while (
-    session.slidesBuffer.length > MAX_SLIDES_BUFFER_EVENTS ||
-    session.slidesBufferBytes > MAX_SLIDES_BUFFER_BYTES
-  ) {
-    const removed = session.slidesBuffer.shift();
-    if (!removed) break;
-    session.slidesBufferBytes -= removed.bytes;
-  }
-  if (evt.event === "done" || evt.event === "error") {
-    session.slidesDone = true;
-  }
-  if (evt.event === "status") {
-    session.slidesLastStatus = evt.data.text;
-  }
-}
-
-function emitMeta(
-  session: Session,
-  patch: Partial<{
-    model: string | null;
-    modelLabel: string | null;
-    inputSummary: string | null;
-    summaryFromCache: boolean | null;
-  }>,
-  onSessionEvent?: ((event: SessionEvent, sessionId: string) => void) | null,
-) {
-  const next = { ...session.lastMeta, ...patch };
-  if (
-    next.model === session.lastMeta.model &&
-    next.modelLabel === session.lastMeta.modelLabel &&
-    next.inputSummary === session.lastMeta.inputSummary &&
-    next.summaryFromCache === session.lastMeta.summaryFromCache
-  ) {
-    return;
-  }
-  session.lastMeta = next;
-  pushToSession(session, { event: "meta", data: next }, onSessionEvent);
-}
-
-function emitSlides(
-  session: Session,
-  data: SseSlidesData,
-  onSessionEvent?: ((event: SessionEvent, sessionId: string) => void) | null,
-) {
-  pushToSession(session, { event: "slides", data }, onSessionEvent);
-  pushSlidesToSession(session, { event: "slides", data }, onSessionEvent);
-}
-
-function emitSlidesStatus(
-  session: Session,
-  text: string,
-  onSessionEvent?: ((event: SessionEvent, sessionId: string) => void) | null,
-) {
-  const trimmed = text.trim();
-  if (!trimmed) return;
-  pushSlidesToSession(session, { event: "status", data: { text: trimmed } }, onSessionEvent);
-}
-
-function emitSlidesDone(
-  session: Session,
-  result: { ok: boolean; error?: string | null },
-  onSessionEvent?: ((event: SessionEvent, sessionId: string) => void) | null,
-) {
-  if (!result.ok) {
-    const message = result.error?.trim() || "Slides failed.";
-    pushSlidesToSession(session, { event: "error", data: { message } }, onSessionEvent);
-  }
-  pushSlidesToSession(session, { event: "done", data: {} }, onSessionEvent);
 }
 
 function resolveHomeDir(env: Record<string, string | undefined>): string {
@@ -432,38 +193,6 @@ function resolveToolPath(
   return resolveExecutableInPath(binary, env);
 }
 
-function endSession(session: Session) {
-  for (const res of session.clients) {
-    res.end();
-  }
-  session.clients.clear();
-  for (const res of session.slidesClients) {
-    res.end();
-  }
-  session.slidesClients.clear();
-}
-
-function scheduleSessionCleanup({
-  session,
-  sessions,
-  delayMs = 60_000,
-}: {
-  session: Session;
-  sessions: Map<string, Session>;
-  delayMs?: number;
-}) {
-  setTimeout(() => {
-    const ageMs = Date.now() - session.createdAtMs;
-    const slidesPending = session.slidesRequested && !session.slidesDone;
-    if (!slidesPending || ageMs > MAX_SESSION_LIFETIME_MS) {
-      sessions.delete(session.id);
-      endSession(session);
-      return;
-    }
-    scheduleSessionCleanup({ session, sessions, delayMs });
-  }, delayMs).unref();
-}
-
 export function buildHealthPayload(importMetaUrl?: string) {
   return { ok: true, pid: process.pid, version: resolvePackageVersion(importMetaUrl) };
 }
@@ -511,8 +240,7 @@ export async function runDaemonServer({
 
   const server = http.createServer((req, res) => {
     void (async () => {
-      const origin = resolveOriginHeader(req);
-      const cors = corsHeaders(origin);
+      const cors = readCorsHeaders(req);
 
       if (req.method === "OPTIONS") {
         res.writeHead(204, cors);
@@ -670,7 +398,7 @@ export async function runDaemonServer({
           return;
         }
 
-        const session = createSession();
+        const session = createSession(() => randomUUID());
         refreshSessions.set(session.id, session);
         activeRefreshSessionId = session.id;
         json(res, 200, { ok: true, id: session.id }, cors);
@@ -843,7 +571,7 @@ export async function runDaemonServer({
           return;
         }
 
-        const session = createSession();
+        const session = createSession(() => randomUUID());
         session.slidesRequested = Boolean(slidesSettings);
         sessions.set(session.id, session);
         const requestLogger = daemonLogger.getSubLogger("daemon.summarize", {
@@ -1248,7 +976,7 @@ export async function runDaemonServer({
                 : {}),
             });
           } finally {
-            scheduleSessionCleanup({ session, sessions });
+            scheduleSessionCleanup({ session, sessions, refreshSessions });
           }
         });
         return;
@@ -1631,8 +1359,7 @@ export async function runDaemonServer({
 
       text(res, 404, "Not found", cors);
     })().catch((error) => {
-      const origin = resolveOriginHeader(req);
-      const cors = corsHeaders(origin);
+      const cors = readCorsHeaders(req);
       const message = error instanceof Error ? error.message : String(error);
       if (!res.headersSent) {
         json(res, 500, { ok: false, error: message }, cors);
