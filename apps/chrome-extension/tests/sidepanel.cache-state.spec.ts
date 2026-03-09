@@ -22,6 +22,7 @@ import {
   getPanelSlidesTimeline,
   getPanelSummaryMarkdown,
   waitForApplySlidesHook,
+  waitForSlidesRuntimeHooks,
 } from "./helpers/panel-hooks";
 
 test("sidepanel restores cached state when switching YouTube tabs", async ({
@@ -486,7 +487,7 @@ test("sidepanel keeps slide summaries isolated when switching YouTube videos mid
       ).__summarizeTestHooks = {};
     });
     await waitForPanelPort(page);
-    await waitForApplySlidesHook(page);
+    await waitForSlidesRuntimeHooks(page);
     await routePlaceholderSlideImages(page);
     const applyBgMessage = async (message: object) => {
       await page.evaluate((payload) => {
@@ -673,14 +674,27 @@ test("sidepanel keeps slide summaries isolated when switching YouTube videos mid
         reason: "manual",
       },
     });
+    const waitForAlphaSummaryResponse = page.waitForResponse(
+      (response) =>
+        response.url().includes("/v1/summarize/slides-a/events") && response.status() === 200,
+      { timeout: 20_000 },
+    );
+    const waitForAlphaSlidesResponse = page.waitForResponse(
+      (response) =>
+        response.url().includes("/v1/summarize/slides-a/slides/events") &&
+        response.status() === 200,
+      { timeout: 20_000 },
+    );
     await applyBgMessage({
       type: "slides:run",
       ok: true,
       runId: "slides-a",
       url: alphaUrl,
     });
-    await applySlidesPayload(page, alphaPayload);
-    await expect.poll(async () => (await getPanelSlidesTimeline(page)).length).toBe(2);
+    await Promise.all([waitForAlphaSummaryResponse, waitForAlphaSlidesResponse]);
+    await expect
+      .poll(async () => (await getPanelSlidesTimeline(page)).length, { timeout: 20_000 })
+      .toBe(2);
 
     await applyBgMessage({ type: "ui:state", state: tabBState });
     await applyBgMessage({
@@ -693,14 +707,25 @@ test("sidepanel keeps slide summaries isolated when switching YouTube videos mid
         reason: "manual",
       },
     });
+    const waitForBravoSummaryResponse = page.waitForResponse(
+      (response) =>
+        response.url().includes("/v1/summarize/slides-b/events") && response.status() === 200,
+      { timeout: 20_000 },
+    );
+    const waitForBravoSlidesResponse = page.waitForResponse(
+      (response) =>
+        response.url().includes("/v1/summarize/slides-b/slides/events") &&
+        response.status() === 200,
+      { timeout: 20_000 },
+    );
     await applyBgMessage({
       type: "slides:run",
       ok: true,
       runId: "slides-b",
       url: bravoUrl,
     });
+    await Promise.all([waitForBravoSummaryResponse, waitForBravoSlidesResponse]);
     await expect(page.locator("#title")).toHaveText("Bravo Tab");
-    await applySlidesPayload(page, bravoPayload);
 
     await expect
       .poll(async () => await getPanelSlidesSummaryMarkdown(page), { timeout: 20_000 })

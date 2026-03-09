@@ -151,6 +151,31 @@ export async function waitForApplySlidesHook(page: Page) {
   );
 }
 
+export async function waitForSlidesRuntimeHooks(page: Page) {
+  await page.waitForFunction(
+    () => {
+      const hooks = (
+        window as typeof globalThis & {
+          __summarizeTestHooks?: {
+            applySlidesPayload?: (payload: unknown) => void;
+            applyBgMessage?: (message: object) => void;
+            applySummaryMarkdown?: (markdown: string) => void;
+            getSlidesSummaryMarkdown?: () => string;
+          };
+        }
+      ).__summarizeTestHooks;
+      return (
+        typeof hooks?.applySlidesPayload === "function" &&
+        typeof hooks?.applyBgMessage === "function" &&
+        typeof hooks?.applySummaryMarkdown === "function" &&
+        typeof hooks?.getSlidesSummaryMarkdown === "function"
+      );
+    },
+    null,
+    { timeout: 10_000 },
+  );
+}
+
 export async function waitForTranscriptTimedTextHook(page: Page) {
   await page.waitForFunction(
     () => {

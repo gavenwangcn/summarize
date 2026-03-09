@@ -20,6 +20,7 @@ import {
   getPanelSlidesSummaryMarkdown,
   getPanelSlidesTimeline,
   waitForApplySlidesHook,
+  waitForSlidesRuntimeHooks,
   waitForSettingsHydratedHook,
   waitForTranscriptTimedTextHook,
 } from "./helpers/panel-hooks";
@@ -45,7 +46,7 @@ test("sidepanel replaces placeholder slides with the final smaller payload", asy
     const page = await openExtensionPage(harness, "sidepanel.html", "#title");
     await waitForPanelPort(page);
     await waitForSettingsHydratedHook(page);
-    await waitForApplySlidesHook(page);
+    await waitForSlidesRuntimeHooks(page);
     await waitForTranscriptTimedTextHook(page);
     await routePlaceholderSlideImages(page);
 
@@ -212,6 +213,7 @@ test("sidepanel uses slide summaries when the summary stream finishes before sli
     const page = await openExtensionPage(harness, "sidepanel.html", "#title");
     await waitForPanelPort(page);
     await waitForSettingsHydratedHook(page);
+    await waitForSlidesRuntimeHooks(page);
     await routePlaceholderSlideImages(page);
 
     const slidesMarkdown = [

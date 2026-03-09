@@ -524,7 +524,31 @@ export async function openExtensionPage(
 }
 
 export async function closeExtension(context: BrowserContext, userDataDir: string) {
-  await context.close();
+  for (const page of context.pages()) {
+    try {
+      await page.unroute("**/*");
+    } catch {}
+    try {
+      await page.close({ runBeforeUnload: false });
+    } catch {}
+  }
+
+  try {
+    await context.unroute("**/*");
+  } catch {}
+
+  try {
+    await Promise.race([
+      context.close(),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("Timed out closing extension context")), 10_000),
+      ),
+    ]);
+  } catch {
+    try {
+      await context.browser()?.close();
+    } catch {}
+  }
   fs.rmSync(userDataDir, { recursive: true, force: true });
 }
 
