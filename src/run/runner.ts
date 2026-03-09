@@ -15,10 +15,8 @@ import {
   handleRefreshFreeRequest,
 } from "./cli-preflight.js";
 import { parseCliProviderArg } from "./env.js";
-import { extractAssetContent } from "./flows/asset/extract.js";
 import { handleFileInput, isTranscribableExtension, withUrlAsset } from "./flows/asset/input.js";
 import { summarizeMediaFile as summarizeMediaFileImpl } from "./flows/asset/media.js";
-import { outputExtractedAsset } from "./flows/asset/output.js";
 import { summarizeAsset as summarizeAssetFlow } from "./flows/asset/summary.js";
 import { runUrlFlow } from "./flows/url/flow.js";
 import { attachRichHelp, buildProgram } from "./help.js";
@@ -31,6 +29,7 @@ import { resolveModelSelection } from "./run-models.js";
 import { resolveDesiredOutputTokens } from "./run-output.js";
 import { resolveStreamSettings } from "./run-stream.js";
 import { createRunnerFlowContexts } from "./runner-contexts.js";
+import { executeRunnerInput } from "./runner-execution.js";
 import { resolveRunnerFlags } from "./runner-flags.js";
 import {
   applyWidthOverride,
@@ -41,7 +40,6 @@ import {
 } from "./runner-setup.js";
 import { resolveRunnerSlidesSettings } from "./runner-slides.js";
 import { handleSlidesCliRequest } from "./slides-cli.js";
-import { createTempFileFromStdin } from "./stdin-temp-file.js";
 import { createSummaryEngine } from "./summary-engine.js";
 import { isRichTty, supportsColor } from "./terminal.js";
 import { handleTranscriberCliRequest } from "./transcriber-cli.js";
@@ -631,96 +629,57 @@ export async function runCli(
       estimateCostUsd,
     });
 
-    if (inputTarget.kind === "stdin") {
-      const stdinTempFile = await createTempFileFromStdin({
-        stream: stdin ?? process.stdin,
-      });
-      try {
-        const stdinInputTarget = { kind: "file" as const, filePath: stdinTempFile.filePath };
-        if (await handleFileInput(assetInputContext, stdinInputTarget)) {
-          return;
-        }
-        throw new Error("Failed to process stdin input");
-      } finally {
-        await stdinTempFile.cleanup();
-      }
-    }
-
-    if (await handleFileInput(assetInputContext, inputTarget)) {
-      return;
-    }
-    if (
-      url &&
-      (await withUrlAsset(assetInputContext, url, isYoutubeUrl, async ({ loaded, spinner }) => {
-        if (extractMode) {
-          if (progressEnabled) spinner.setText(renderSpinnerStatus("Extracting text"));
-          const extracted = await extractAssetContent({
-            ctx: {
-              env,
-              envForRun,
-              execFileImpl,
-              timeoutMs,
-              preprocessMode,
-            },
-            attachment: loaded.attachment,
-          });
-          await outputExtractedAsset({
-            io: { env, envForRun, stdout, stderr },
-            flags: {
-              timeoutMs,
-              preprocessMode,
-              format,
-              plain,
-              json,
-              metricsEnabled,
-              metricsDetailed,
-              shouldComputeReport,
-              runStartedAtMs,
-              verboseColor,
-            },
-            hooks: {
-              clearProgressForStdout,
-              restoreProgressAfterStdout,
-              buildReport,
-              estimateCostUsd,
-            },
-            url,
-            sourceLabel: loaded.sourceLabel,
-            attachment: loaded.attachment,
-            extracted,
-            apiStatus: {
-              xaiApiKey,
-              apiKey,
-              openrouterApiKey,
-              apifyToken,
-              firecrawlConfigured,
-              googleConfigured,
-              anthropicConfigured,
-            },
-          });
-          return;
-        }
-
-        if (progressEnabled) spinner.setText(renderSpinnerStatus("Summarizing"));
-        await summarizeAsset({
-          sourceKind: "asset-url",
-          sourceLabel: loaded.sourceLabel,
-          attachment: loaded.attachment,
-          onModelChosen: (modelId) => {
-            if (!progressEnabled) return;
-            spinner.setText(renderSpinnerStatusWithModel("Summarizing", modelId));
-          },
-        });
-      }))
-    ) {
-      return;
-    }
-
-    if (!url) {
-      throw new Error("Only HTTP and HTTPS URLs can be summarized");
-    }
-
-    await runUrlFlow({ ctx: urlFlowContext, url, isYoutubeUrl });
+    await executeRunnerInput({
+      inputTarget,
+      stdin: stdin ?? process.stdin,
+      handleFileInputContext: assetInputContext,
+      url,
+      isYoutubeUrl,
+      withUrlAssetContext: assetInputContext,
+      extractMode,
+      progressEnabled,
+      renderSpinnerStatus,
+      renderSpinnerStatusWithModel,
+      extractAssetContext: {
+        env,
+        envForRun,
+        execFileImpl,
+        timeoutMs,
+        preprocessMode,
+      },
+      outputExtractedAssetContext: {
+        io: { env, envForRun, stdout, stderr },
+        flags: {
+          timeoutMs,
+          preprocessMode,
+          format,
+          plain,
+          json,
+          metricsEnabled,
+          metricsDetailed,
+          shouldComputeReport,
+          runStartedAtMs,
+          verboseColor,
+        },
+        hooks: {
+          clearProgressForStdout,
+          restoreProgressAfterStdout,
+          buildReport,
+          estimateCostUsd,
+        },
+        apiStatus: {
+          xaiApiKey,
+          apiKey,
+          openrouterApiKey,
+          apifyToken,
+          firecrawlConfigured,
+          googleConfigured,
+          anthropicConfigured,
+        },
+      },
+      summarizeAsset,
+      runUrlFlowContext: urlFlowContext,
+    });
   } finally {
     cacheState.store?.close();
   }
