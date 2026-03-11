@@ -11,6 +11,7 @@ import {
   splitSlideTitleFromText,
 } from "../../../../src/run/flows/url/slides-text.js";
 import type { SummaryLength } from "../../../../src/shared/contracts.js";
+import type { SseSlidesData } from "../../../../src/shared/sse-events.js";
 import type { ExtensionHarness } from "./extension-harness";
 import { getBackground } from "./extension-harness";
 
@@ -184,7 +185,7 @@ export async function waitForSlidesSnapshot(
   runId: string,
   token: string,
   timeoutMs = 60_000,
-): Promise<{ slides: Array<unknown> }> {
+): Promise<SseSlidesData> {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
     const controller = new AbortController();

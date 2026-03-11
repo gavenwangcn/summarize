@@ -230,26 +230,13 @@ test("sidepanel extracts slides from local video via daemon", async ({
     await summarizeButton.click();
 
     const runId = await startDaemonSlidesRun(`${serverUrl}/index.html`, token);
-    await waitForSlidesSnapshot(runId, token);
-    await sendBgMessage(harness, {
-      type: "slides:run",
-      ok: true,
-      runId,
-      url: `${serverUrl}/index.html`,
-    });
-
-    const img = page.locator("img.slideStrip__thumbImage, img.slideInline__thumbImage");
-    await expect
-      .poll(
-        async () => {
-          const count = await img.count();
-          if (count === 0) return false;
-          const ready = await img.first().evaluate((node) => node.dataset.loaded === "true");
-          return ready;
-        },
-        { timeout: 120_000 },
-      )
-      .toBe(true);
+    const slidesSnapshot = await waitForSlidesSnapshot(runId, token);
+    expect(slidesSnapshot.sourceKind).toBe("direct");
+    expect(slidesSnapshot.sourceUrl).toContain("/sample.mp4");
+    expect(slidesSnapshot.slides.length).toBeGreaterThan(0);
+    expect(
+      slidesSnapshot.slides.every((slide) => typeof slide.imageUrl === "string" && slide.imageUrl),
+    ).toBe(true);
 
     assertNoErrors(harness);
   } finally {

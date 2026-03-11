@@ -287,8 +287,10 @@ test("sidepanel loads slide images after they become ready", async ({
         window as typeof globalThis & { __summarizeTestHooks?: Record<string, unknown> }
       ).__summarizeTestHooks = {};
     });
+    await waitForPanelPort(page);
+    const youtubeUrl = "https://www.youtube.com/watch?v=dQw4w9WgXcQ";
     const mediaState = buildUiState({
-      tab: { id: 1, url: "https://example.com", title: "Example" },
+      tab: { id: 1, url: youtubeUrl, title: "Example Video" },
       media: { hasVideo: true, hasAudio: false, hasCaptions: false },
       stats: { pageWords: 120, videoDurationSeconds: 90 },
       status: "",
@@ -301,7 +303,7 @@ test("sidepanel loads slide images after they become ready", async ({
       .toBe(1);
 
     const slidesPayload = {
-      sourceUrl: "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+      sourceUrl: youtubeUrl,
       sourceId: "dQw4w9WgXcQ",
       sourceKind: "youtube",
       ocrAvailable: false,

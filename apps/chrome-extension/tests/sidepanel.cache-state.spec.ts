@@ -21,6 +21,7 @@ import {
 import {
   applySlidesPayload,
   getPanelSlideDescriptions,
+  getPanelSlidesSummaryMarkdown,
   getPanelSlidesTimeline,
   getPanelSummaryMarkdown,
   waitForApplySlidesHook,
@@ -731,14 +732,35 @@ test("sidepanel keeps slide summaries isolated when switching YouTube videos mid
     });
 
     await expect
-      .poll(async () => (await getPanelSlideDescriptions(page)).length, {
-        timeout: 20_000,
-      })
-      .toBe(2);
+      .poll(
+        async () => {
+          await page.evaluate(() => {
+            const hooks = (
+              window as typeof globalThis & {
+                __summarizeTestHooks?: { forceRenderSlides?: () => number | void };
+              }
+            ).__summarizeTestHooks;
+            hooks?.forceRenderSlides?.();
+          });
+          const descriptions = (await getPanelSlideDescriptions(page)).map(([, text]) =>
+            text.toLowerCase(),
+          );
+          const slidesSummaryMarkdown = (await getPanelSlidesSummaryMarkdown(page)).toLowerCase();
+          return (
+            descriptions.length === 2 &&
+            descriptions.every((text) => text.includes("bravo")) &&
+            descriptions.every((text) => !text.includes("alpha")) &&
+            slidesSummaryMarkdown.includes("bravo summary body one") &&
+            !slidesSummaryMarkdown.includes("alpha")
+          );
+        },
+        { timeout: 20_000 },
+      )
+      .toBe(true);
 
     const bravoDescriptions = await getPanelSlideDescriptions(page);
-    expect(bravoDescriptions[0]?.[1] ?? "").toContain("bravo");
-    expect(bravoDescriptions[1]?.[1] ?? "").toContain("bravo");
+    expect((bravoDescriptions[0]?.[1] ?? "").toLowerCase()).toContain("bravo");
+    expect((bravoDescriptions[1]?.[1] ?? "").toLowerCase()).toContain("bravo");
     await expect(page.locator(".slideGallery__thumb img")).toHaveCount(2);
 
     await page.waitForTimeout(1_200);
