@@ -11,6 +11,7 @@ import {
   sleep,
 } from "./generate-text-shared.js";
 import { streamTextWithContext } from "./generate-text-stream.js";
+import { logLlmProviderRequest } from "./log-provider-request.js";
 import { parseGatewayStyleModelId } from "./model-id.js";
 import type { Prompt } from "./prompt.js";
 import { resolveOpenAiCompatibleClientConfigForProvider } from "./provider-capabilities.js";
@@ -160,6 +161,7 @@ export async function generateTextWithModelId({
     apiKey: string;
     signal: AbortSignal;
   }): Promise<{ text: string; usage: LlmTokenUsage | null }> => {
+    logLlmProviderRequest(model, parsed.canonical);
     const result = await completeSimple(model, context, {
       ...(typeof effectiveTemperature === "number" ? { temperature: effectiveTemperature } : {}),
       ...(typeof maxOutputTokens === "number" ? { maxTokens: maxOutputTokens } : {}),
@@ -186,6 +188,7 @@ export async function generateTextWithModelId({
           context,
           xaiBaseUrlOverride,
         });
+        logLlmProviderRequest(model, parsed.canonical);
         const result = await completeSimple(model, context, {
           ...(typeof effectiveTemperature === "number"
             ? { temperature: effectiveTemperature }

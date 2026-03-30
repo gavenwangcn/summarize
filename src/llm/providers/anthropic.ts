@@ -3,6 +3,7 @@ import { completeSimple } from "@mariozechner/pi-ai";
 import type { Attachment } from "../attachments.js";
 import type { LlmTokenUsage } from "../types.js";
 import { normalizeAnthropicUsage, normalizeTokenUsage } from "../usage.js";
+import { logLlmProviderHttpUrl, logLlmProviderRequest } from "../log-provider-request.js";
 import { resolveAnthropicModel } from "./models.js";
 import { bytesToBase64, extractText, resolveBaseUrlOverride } from "./shared.js";
 
@@ -73,6 +74,7 @@ export async function completeAnthropicText({
     context,
     anthropicBaseUrlOverride,
   });
+  logLlmProviderRequest(model, `anthropic/${modelId}`);
   const result = await completeSimple(model, context, {
     ...(typeof temperature === "number" ? { temperature } : {}),
     ...(typeof maxOutputTokens === "number" ? { maxTokens: maxOutputTokens } : {}),
@@ -135,6 +137,7 @@ export async function completeAnthropicDocument({
   };
 
   try {
+    logLlmProviderHttpUrl(`anthropic document (${modelId})`, url);
     const response = await fetchImpl(url, {
       method: "POST",
       headers: {

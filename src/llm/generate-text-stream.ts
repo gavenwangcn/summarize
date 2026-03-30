@@ -16,6 +16,7 @@ import {
   resolveXaiModel,
 } from "./providers/models.js";
 import type { OpenAiClientConfig } from "./providers/types.js";
+import { logLlmProviderRequest } from "./log-provider-request.js";
 import type { LlmTokenUsage } from "./types.js";
 
 export type StreamTextWithContextArgs = {
@@ -183,6 +184,7 @@ export async function streamTextWithContext({
         context,
         xaiBaseUrlOverride,
       });
+      logLlmProviderRequest(model, parsed.canonical);
       const stream = streamSimple(model, context, {
         ...(typeof effectiveTemperature === "number" ? { temperature: effectiveTemperature } : {}),
         ...(typeof maxOutputTokens === "number" ? { maxTokens: maxOutputTokens } : {}),
@@ -220,6 +222,7 @@ export async function streamTextWithContext({
         context,
         googleBaseUrlOverride,
       });
+      logLlmProviderRequest(model, parsed.canonical);
       const stream = streamSimple(model, context, {
         ...(typeof effectiveTemperature === "number" ? { temperature: effectiveTemperature } : {}),
         ...(typeof maxOutputTokens === "number" ? { maxTokens: maxOutputTokens } : {}),
@@ -253,6 +256,7 @@ export async function streamTextWithContext({
         context,
         anthropicBaseUrlOverride,
       });
+      logLlmProviderRequest(model, parsed.canonical);
       const stream = streamSimple(model, context, {
         ...(typeof effectiveTemperature === "number" ? { temperature: effectiveTemperature } : {}),
         ...(typeof maxOutputTokens === "number" ? { maxTokens: maxOutputTokens } : {}),
@@ -288,6 +292,7 @@ export async function streamTextWithContext({
         forceChatCompletions,
       });
       const model = resolveOpenAiModel({ modelId: parsed.model, context, openaiConfig });
+      logLlmProviderRequest(model, parsed.canonical);
       const stream = streamSimple(model, context, {
         ...(typeof effectiveTemperature === "number" ? { temperature: effectiveTemperature } : {}),
         ...(typeof maxOutputTokens === "number" ? { maxTokens: maxOutputTokens } : {}),

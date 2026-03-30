@@ -6,6 +6,7 @@ import { createUnsupportedFunctionalityError } from "../errors.js";
 import type { LlmTokenUsage } from "../types.js";
 import { normalizeOpenAiUsage, normalizeTokenUsage } from "../usage.js";
 import { resolveOpenAiModel } from "./models.js";
+import { logLlmProviderHttpUrl, logLlmProviderRequest } from "../log-provider-request.js";
 import { bytesToBase64 } from "./shared.js";
 import type { OpenAiClientConfig } from "./types.js";
 
@@ -116,6 +117,7 @@ export async function completeOpenAiText({
   signal: AbortSignal;
 }): Promise<{ text: string; usage: LlmTokenUsage | null }> {
   const model = resolveOpenAiModel({ modelId, context, openaiConfig });
+  logLlmProviderRequest(model, `openai/${modelId}`);
   const result = await completeSimple(model, context, {
     ...(typeof temperature === "number" ? { temperature } : {}),
     ...(typeof maxOutputTokens === "number" ? { maxTokens: maxOutputTokens } : {}),
@@ -190,6 +192,7 @@ export async function completeOpenAiDocument({
   };
 
   try {
+    logLlmProviderHttpUrl(`openai document (${modelId})`, url);
     const response = await fetchImpl(url, {
       method: "POST",
       headers: {

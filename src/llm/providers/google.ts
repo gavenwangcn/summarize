@@ -3,6 +3,7 @@ import { completeSimple } from "@mariozechner/pi-ai";
 import type { Attachment } from "../attachments.js";
 import type { LlmTokenUsage } from "../types.js";
 import { normalizeGoogleUsage, normalizeTokenUsage } from "../usage.js";
+import { logLlmProviderHttpUrl, logLlmProviderRequest } from "../log-provider-request.js";
 import { resolveGoogleModel } from "./models.js";
 import { bytesToBase64, resolveBaseUrlOverride } from "./shared.js";
 
@@ -75,6 +76,7 @@ export async function completeGoogleText({
   googleBaseUrlOverride?: string | null;
 }): Promise<{ text: string; usage: LlmTokenUsage | null }> {
   const model = resolveGoogleModel({ modelId, context, googleBaseUrlOverride });
+  logLlmProviderRequest(model, `google/${modelId}`);
   const result = await completeSimple(model, context, {
     ...(typeof temperature === "number" ? { temperature } : {}),
     ...(typeof maxOutputTokens === "number" ? { maxTokens: maxOutputTokens } : {}),
@@ -139,6 +141,7 @@ export async function completeGoogleDocument({
   };
 
   try {
+    logLlmProviderHttpUrl(`google document (${modelId})`, url);
     const response = await fetchImpl(url, {
       method: "POST",
       headers: { "content-type": "application/json" },

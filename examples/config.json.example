@@ -1,0 +1,12 @@
+{
+  "model": "openai/gpt-5",
+  "openai": {
+    "baseUrl": "http://156.239.41.135:3000/openai-codex-oauth/v1"
+  },
+  "env": {
+    "OPENAI_API_KEY": "00009"
+  },
+  "output": {
+    "language": "zh"
+  }
+}

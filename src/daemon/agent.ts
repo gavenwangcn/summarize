@@ -1,6 +1,7 @@
 import type { AssistantMessage, Tool } from "@mariozechner/pi-ai";
 import { completeSimple, streamSimple } from "@mariozechner/pi-ai";
 import { buildPromptHash } from "../cache.js";
+import { logLlmProviderRequest } from "../llm/log-provider-request.js";
 import { resolveAgentModel, resolveApiKeyForModel } from "./agent-model.js";
 import {
   buildSystemPrompt,
@@ -325,6 +326,7 @@ export async function streamAgentResponse({
   const { provider, model, maxOutputTokens, apiKeys } = resolved;
   const apiKey = resolveApiKeyForModel({ provider, apiKeys });
 
+  logLlmProviderRequest(model, `${provider}/${model.id}`);
   const stream = streamSimple(
     model,
     {
@@ -417,6 +419,7 @@ export async function completeAgentResponse({
   const { provider, model, maxOutputTokens, apiKeys } = resolved;
   const apiKey = resolveApiKeyForModel({ provider, apiKeys });
 
+  logLlmProviderRequest(model, `${provider}/${model.id}`);
   const assistant = await completeSimple(
     model,
     {
